@@ -1,3 +1,4 @@
 # ExcelToMif dependencies
 # Update with: pip freeze > requirements.txt after every pip install
 python-dotenv>=1.0.0
+openpyxl>=3.1.5
