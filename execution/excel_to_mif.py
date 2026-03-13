@@ -1,505 +1,1139 @@
-"""
-excel_to_mif.py  –  Convert an Excel FRU list to a MIF document.
+#!/usr/bin/env python3
+"""Excel FRU List → FrameMaker MIF converter.
+
+Replicates VBA macro ButtonGenerateK3_2_Klepnut / ButtonGenerateK3_All_Klepnut.
+Always operates in L2_Checked=True mode.
 
 Usage:
-    python excel_to_mif.py <input.xlsx>  [template.mif]  [output.mif]
-
-    • template.mif defaults to  ../Level 2 - FRU Master List_templ.mif
-    • output.mif   defaults to  <input_basename>_d1.mif  (same folder as input)
-
-Excel sheet  "GenCh3"  structure expected:
-    Row 1       : metadata  – col A = doc_number, col B = doc_type ("Chapter"),
-                              col C = chapter_name ("P-series G7")
-    Rows 2 – N  : data rows until a row with col A in SKIP_CATEGORIES or col A is None
-                  col A = category, col B = description, col C = order_code,
-                  col D = reference path(s) newline-separated ("Database/L3/XXXXXX"),
-                  col H = item_number (not used, kept for reference)
+    python execution/excel_to_mif.py                        # batch: all pending K3List items
+    python execution/excel_to_mif.py --all                  # same
+    python execution/excel_to_mif.py <input.xlsx> [template.mif] [output.mif]
 """
 
+import sys
 import os
 import re
-import sys
-import json
+import time
 import openpyxl
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-
-SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR  = os.path.dirname(SCRIPT_DIR)
-DEFAULT_TMPL = os.path.join(PROJECT_DIR, "Level 2 - FRU Master List_templ.mif")
-FRU_HDR_JSON = os.path.join(SCRIPT_DIR, "fru_header.json")
-
-SKIP_CATEGORIES = {"Service Virtual Assistant Content", "MarkDown"}
-
-# ---------------------------------------------------------------------------
-# Load the pre-extracted FRU table header template
-# (extracted from a reference output; contains __UNIQUE__ placeholders)
-# ---------------------------------------------------------------------------
-
-with open(FRU_HDR_JSON, encoding="utf-8") as _f:
-    FRU_HEADER_LINES = json.load(_f)      # list[str]
-
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+XLSM_FILE = os.path.join(PROJECT_DIR, "Ch3 Generator.xlsm")
+TEMPLATE_MIF = os.path.join(PROJECT_DIR, "Level 2 - FRU Master List_templ.mif")
+OUTPUT_DIR = os.path.join(PROJECT_DIR, "L2 update")
+TBL_SHEET = "TblInsertNewTempl"
+GENCH3_SHEET = "GenCh3"
 
 # ---------------------------------------------------------------------------
-# Excel reading
+# Utilities
 # ---------------------------------------------------------------------------
 
-def read_excel(xlsx_path: str):
-    """Return (doc_number, cross_section, data_rows).
+def col_num(letter):
+    return ord(letter.upper()) - ord('A') + 1
 
-    data_rows: list of (description, order_code, refs_list)
-        refs_list: list of reference basenames like ['312867', '311903']
-    """
-    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-    # Try the known sheet name first
-    if "GenCh3" in wb.sheetnames:
-        ws = wb["GenCh3"]
-    else:
-        ws = wb.active
 
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        raise ValueError("Empty spreadsheet")
-
-    # Row 1: metadata
-    meta = rows[0]
-    doc_number   = str(meta[0])
-    doc_type     = str(meta[1]) if meta[1] is not None else "Chapter"
-    chapter_name = str(meta[2]) if meta[2] is not None else ""
-    cross_section = f"{chapter_name} {doc_type}"   # e.g. "P-series G7 Chapter"
-
-    # Data rows: read until a separator / empty row
-    data_rows = []
-    for row in rows[1:]:
-        cat = row[0]
-        if cat is None or str(cat) in SKIP_CATEGORIES:
+def get_contiguous(ws, col, start=2):
+    """Rows from `start` until first None (like VBA xlDown)."""
+    result = []
+    for row in range(start, ws.max_row + 1):
+        v = ws.cell(row=row, column=col).value
+        if v is None:
             break
-        order_code  = row[2]
-        description = row[1] if row[1] is not None else ""
-        ref_raw     = row[3]  # may be None or "Database/L3/XYZ\nDatabase/L3/ABC"
+        result.append(str(v))
+    return result
 
-        refs = []
-        if ref_raw:
-            for part in str(ref_raw).split("\n"):
-                part = part.strip()
-                if part:
-                    # basename is the last path component without extension
-                    refs.append(part.split("/")[-1])
 
-        data_rows.append((str(description), str(order_code) if order_code is not None else "", refs))
+def get_rows(ws, col, r1, r2):
+    """All non-None cell values in rows r1..r2 (inclusive)."""
+    result = []
+    for row in range(r1, r2 + 1):
+        v = ws.cell(row=row, column=col).value
+        if v is not None:
+            result.append(str(v))
+    return result
 
-    return doc_number, cross_section, data_rows
+
+def strip_apos(s):
+    """Excel strips a leading apostrophe from cell values (text-prefix).
+    VBA strings like "'  <Para " are stored as "  <Para ".
+    """
+    return s[1:] if s.startswith("'") else s
+
+
+def split_200(text):
+    """Split text into ≤200-char chunks."""
+    chunks = []
+    for i in range(0, max(len(text), 1), 200):
+        chunks.append(text[i:i+200])
+    return chunks
 
 
 # ---------------------------------------------------------------------------
-# MIF generation helpers
+# Template blocks
 # ---------------------------------------------------------------------------
 
-def _u(counter: list) -> str:
-    """Increment the unique counter and return the MIF <Unique N> line."""
-    counter[0] += 1
-    return f"<Unique {counter[0]}>"
+class Blocks:
+    """MIF template blocks from TblInsertNewTempl sheet."""
+
+    def __init__(self, xlsm_path):
+        wb = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
+        ws = wb[TBL_SHEET]
+
+        def gc(letter, start=2):
+            return get_contiguous(ws, col_num(letter), start)
+
+        def gr(letter, r1, r2):
+            return get_rows(ws, col_num(letter), r1, r2)
+
+        # Before-EOF blocks
+        self.I = gc('I')        # empty line (2pt white in template)
+        self.H = gc('H')        # new chapter (Title 1)
+        self.V = gc('V')        # sub-chapter (AI)
+        self.G = gc('G')        # link
+        self.J = gc('J')        # note
+        self.K = gc('K')        # caution
+        self.U = gc('U')        # bullet (AI)
+        self.W = gc('W')        # text (AI)
+        self.D = gc('D')        # ATbl para (standard/consumable/overview)
+        self.T = gc('T')        # ATbl para (system table)
+
+        # Standard FRU table (col C inserted before > # end of Tbls)
+        self.C_full = gc('C')               # full table (header+row+footer)
+        self.C_row  = gr('C', 504, 622)     # single row template
+
+        # Consumable table
+        self.L_full = gc('L')
+        self.L_row  = gr('L', 493, 591)
+
+        # OverView table
+        self.N_full = gc('N')
+        self.N_row  = gr('N', 504, 622)
+
+        # System table + row
+        self.R = gc('R')
+        self.S = gc('S')
+
+        wb.close()
 
 
-def _cel1_lines(counter: list) -> list:
-    """Cell 1: category placeholder (space). Returns list of raw lines."""
-    return [
-        "    <Cell",
-        "     <CellContent",
-        "      <Notes",
-        "      > # end of Notes",
-        "      <Para",
-        _u(counter),
-        "       <Pgf",
-        "        <PgfTag `CellBody'>",
-        "        <PgfFont",
-        "         <FTag `'>",
-        "         <FPlatformName `W.Arial.R.400'>",
-        "         <FFamily `Arial'>",
-        "         <FVar `Regular'>",
-        "         <FWeight `Regular'>",
-        "         <FAngle `Regular'>",
-        "         <FEncoding `FrameRoman'>",
-        "         <FSize  11.0 pt>",
-        "         <FUnderlining FNoUnderlining>",
-        "         <FOverline No>",
-        "         <FStrike No>",
-        "         <FChangeBar No>",
-        "         <FOutline No>",
-        "         <FShadow No>",
-        "         <FPairKern Yes>",
-        "         <FTsume No>",
-        "         <FCase FAsTyped>",
-        "         <FPosition FNormal>",
-        "         <FDX  0.0%>",
-        "         <FDY  0.0%>",
-        "         <FDW  0.0%>",
-        "         <FStretch  100.0%>",
-        "         <FLanguage USEnglish>",
-        "         <FLocked No>",
-        "         <FSeparation 0>",
-        "         <FColor `Black'>",
-        "        > # end of PgfFont",
-        "        <PgfHyphenate Yes>",
-        "        <PgfPDFStructureLevel 15>",
-        "        <PgfCellMargins  0.0 pt 0.0 pt 0.0 pt 0.0 pt>",
-        "       > # end of Pgf",
-        "       <ParaLine",
-        "        <String ` '>",
-        "       > # end of ParaLine",
-        "      > # end of Para",
-        "     > # end of CellContent",
-        "    > # end of Cell",
-    ]
+# ---------------------------------------------------------------------------
+# MIF document
+# ---------------------------------------------------------------------------
+
+class MifDoc:
+    """MIF lines stored as list; None = cleared (not written)."""
+
+    def __init__(self, template_path):
+        with open(template_path, encoding='latin-1') as f:
+            raw = f.read()
+        self.lines = [ln.rstrip('\r') for ln in raw.split('\n')]
+
+    def find_first(self, pattern, start=0):
+        for i in range(start, len(self.lines)):
+            if self.lines[i] is not None and pattern in self.lines[i]:
+                return i
+        return -1
+
+    def find_last(self, pattern):
+        for i in range(len(self.lines) - 1, -1, -1):
+            if self.lines[i] is not None and pattern in self.lines[i]:
+                return i
+        return -1
+
+    def _insert(self, pos, block):
+        for j, line in enumerate(block):
+            self.lines.insert(pos + j, line)
+
+    def add_before_eof(self, block):
+        idx = self.find_last("# End of MIFFile")
+        if idx < 0:
+            idx = len(self.lines) - 1
+        # VBA inserts at lastRow-1 (before '> # end of TextFlow', not before '# End of MIFFile')
+        self._insert(idx - 1, block)
+
+    def add_before_end_tbls(self, block):
+        """Insert block AT '> # end of Tbls' (shifts it down)."""
+        idx = self.find_last("> # end of Tbls")
+        self._insert(idx, block)
+
+    def add_row_before_end_tbls(self, block):
+        """Insert row template 2 lines before '> # end of Tbls'."""
+        idx = self.find_last("> # end of Tbls")
+        self._insert(idx - 2, block)
+
+    def add_row_system(self, block):
+        """Insert system row 5 lines before '> # end of Tbls'."""
+        idx = self.find_last("> # end of Tbls")
+        self._insert(idx - 5, block)
+
+    def add_before_end_aframes(self, block):
+        idx = self.find_last("# end of Aframes")
+        self._insert(idx, block)
+
+    def replace_first(self, what, replacement, start=0):
+        idx = self.find_first(what, start)
+        if idx >= 0:
+            self.lines[idx] = replacement
+        return idx
+
+    def change_unique(self):
+        counter = 1030000
+        for i in range(len(self.lines)):
+            line = self.lines[i]
+            if line is not None and '<Unique' in line:
+                self.lines[i] = re.sub(r'<Unique\s+\d+>', f'<Unique {counter}>', line)
+                counter += 1
+
+    def get_output(self):
+        return [ln for ln in self.lines if ln is not None and ln != '']
 
 
-def _cel2_lines(counter: list, description: str) -> list:
-    """Cell 2: description with leading space."""
-    return [
-        "    <Cell",
-        "     <CellContent",
-        "      <Notes",
-        "      > # end of Notes",
-        "      <Para",
-        _u(counter),
-        "       <PgfReferenced Yes>",
-        "       <ParaLine",
-        f"        <String ` {description}'>",
-        "       > # end of ParaLine",
-        "      > # end of Para",
-        "     > # end of CellContent",
-        "    > # end of Cell",
-    ]
+# ---------------------------------------------------------------------------
+# Block builders
+# ---------------------------------------------------------------------------
+
+def build_chapter_block(H_block, chapter_name):
+    """Chapter Para for L2_Checked=True: drop CrossSection variable, set chapter name.
+    Strips FSize/FColor so Title 1 chapters are visible in FrameMaker."""
+    blk = list(H_block)
+    idx = next((i for i, l in enumerate(blk) if l and 'Chapter1Name' in l), -1)
+    if idx >= 0:
+        for off in (-4, -3, -2, -1):
+            t = idx + off
+            if 0 <= t < len(blk):
+                blk[t] = None
+        blk[idx] = f"<String `{chapter_name}'>"
+    # Strip FSize/FColor so Title 1 chapter headings are visible in FrameMaker
+    blk = [l for l in blk if l is None or ('<FSize' not in l and "<FColor `White'" not in l)]
+    return [l for l in blk if l is not None]
 
 
-def _cel3_lines(counter: list, order_code: str) -> list:
-    """Cell 3: hyperlink to the FRU file + order_code string."""
-    return [
-        "    <Cell",
-        "     <CellContent",
-        "      <Notes",
-        "      > # end of Notes",
-        "      <Para",
-        _u(counter),
-        "       <PgfTag `CellLink'>",
-        "       <PgfReferenced Yes>",
-        "       <ParaLine",
-        "        <Marker",
-        "         <MType 8>",
-        "         <MTypeName `Hypertext'>",
-        f" <MText `openlink ../../Database/L3/{order_code}_FRU.fm'>",
-        "         <MCurrPage `1'>",
-        _u(counter),
-        "        > # end of Marker",
-        f"        <String `{order_code}'>",
-        "       > # end of ParaLine",
-        "      > # end of Para",
-        "     > # end of CellContent",
-        "    > # end of Cell",
-    ]
+def build_subchapter_block(V_block, chapter_name):
+    """Sub-chapter Para (AI section): drop CrossSection variable,
+    KEEP Pgf font overrides (Title 1.1 AI sub-chapters are intentionally invisible)."""
+    blk = list(V_block)
+    idx = next((i for i, l in enumerate(blk) if l and 'Chapter1Name' in l), -1)
+    if idx >= 0:
+        for off in (-4, -3, -2, -1):
+            t = idx + off
+            if 0 <= t < len(blk):
+                blk[t] = None
+        blk[idx] = f"<String `{chapter_name}'>"
+    return [l for l in blk if l is not None]
 
 
-def _cel4_lines(counter: list, refs: list) -> list:
-    """Cell 4: zero or more hyperlinks to reference files."""
-    lines = [
-        "    <Cell",
-        "     <CellContent",
-        "      <Notes",
-        "      > # end of Notes",
-    ]
-
-    if not refs:
-        # Empty cell with no links
-        lines += [
-            "      <Para",
-            _u(counter),
-            "       <PgfTag `CellLink'>",
-            "       <PgfReferenced Yes>",
-            "       <ParaLine",
-            "       > # end of ParaLine",
-            "      > # end of Para",
+def _chunked_block(blk, placeholder, text):
+    """Replace placeholder with chunked text (200-char splits) in block."""
+    chunks = split_200(text) if text else ['']
+    idx = next((i for i, l in enumerate(blk) if l and placeholder in l), -1)
+    if idx < 0:
+        return [l for l in blk if l is not None]
+    blk[idx] = f"<String `{chunks[0]}'>"
+    extra = []
+    for chunk in chunks[1:]:
+        extra += [
+            strip_apos("'       > # end of ParaLine"),
+            strip_apos("'  <ParaLine "),
+            f"<String `{chunk}'>",
         ]
-    else:
-        # First Para: marker for first ref + String with first basename
-        # If >1 ref, the String also contains a newline + the full second ref path
-        first_ref_basename = refs[0]
-        first_ref_path = f"Database/L3/{refs[0]}"
+    result = blk[:idx+1] + extra + blk[idx+1:]
+    return [l for l in result if l is not None]
 
-        # Build the String content for the first Para
-        if len(refs) == 1:
-            string_content = first_ref_basename
-        else:
-            # The String in the reference output carries the first basename
-            # followed by a literal newline and the second full path
-            # e.g. "311903\nDatabase/L3/312392"
-            extra = "\n".join(f"Database/L3/{r}" for r in refs[1:])
-            string_content = f"{first_ref_basename}\n{extra}"
 
-        lines += [
-            "      <Para",
-            _u(counter),
-            "       <PgfTag `CellLink'>",
-            "       <PgfReferenced Yes>",
-            "       <ParaLine",
-            "        <Marker",
-            "         <MType 8>",
-            "         <MTypeName `Hypertext'>",
-            f" <MText `openlink ../../{first_ref_path}.fm'>",
-            "         <MCurrPage `1'>",
-            _u(counter),
-            "        > # end of Marker",
-            f"        <String `{string_content}'>",
-            "       > # end of ParaLine",
-            "      > # end of Para",
-        ]
+def build_note_block(J_block, text):
+    blk = [l for l in J_block
+           if l is None or ('<FSize' not in l and "<FColor `White'" not in l
+                            and '<PgfLeading' not in l)]
+    return _chunked_block(blk, 'Chapter1_Note', text)
 
-        # Additional Paras for refs[1:]
-        for ref_basename in refs[1:]:
-            lines += [
-                "       <Para",
-                "       <ParaLine",
-                "        <Marker",
-                "         <MType 8>",
-                "         <MTypeName `Hypertext'>",
-                f" <MText `openlink ../../Database/L3/{ref_basename}.fm'>",
-                "         <MCurrPage `1'>",
-                "        > # end of Marker",
-                _u(counter),
-                f"        <String `{ref_basename}'>",
-                "       > # end of ParaLine",
-                "      > # end of Para",
+
+def build_caution_block(K_block, text):
+    blk = [l for l in K_block
+           if l is None or ('<FSize' not in l and "<FColor `White'" not in l
+                            and '<PgfLeading' not in l)]
+    return _chunked_block(blk, 'Chapter1_Caution', text)
+
+
+def build_bullet_block(U_block, text):
+    return _chunked_block(list(U_block), 'Chapter1_Bullet', text)
+
+
+def build_text_block(W_block, text):
+    return _chunked_block(list(W_block), 'Text_Text ', text)
+
+
+def build_link_block(G_block, link_text, link_hyp, link_free=False):
+    blk = list(G_block)
+    for i, l in enumerate(blk):
+        if l and 'Chapter1_LinkHyp' in l:
+            if link_free:
+                blk[i] = f"<MText `{link_hyp}'>"
+            else:
+                blk[i] = f"<MText `openlink ../../database/L3/{link_hyp}.pdf'>"
+            break
+    for i, l in enumerate(blk):
+        if l and 'Chapter1_Link' in l and 'Hyp' not in l:
+            blk[i] = f"<String `{link_text}'>"
+            break
+    return [l for l in blk if l is not None]
+
+
+# ---------------------------------------------------------------------------
+# Remark content builder
+# ---------------------------------------------------------------------------
+
+def _hyp_lines(remarkHyp):
+    return [
+        strip_apos("'        <Font "),
+        strip_apos("'         <FTag `Online'>"),
+        strip_apos("'         <FUnderlining FSingle>"),
+        strip_apos("'         <FLocked No>"),
+        strip_apos("'         <FSeparation 4>"),
+        strip_apos("'         <FColor `Blue'>"),
+        strip_apos("'        > # end of Font"),
+        strip_apos("'        <Marker "),
+        strip_apos("'         <MType 8>"),
+        strip_apos("'         <MTypeName `Hypertext'>"),
+        f"         <MText `openlink ../../Database/{remarkHyp}'>",
+        strip_apos("'         <MTypeName `Hypertext'>"),
+        strip_apos("'         <MCurrPage `1'>"),
+        strip_apos("'        > # end of Marker"),
+    ]
+
+
+def _resolve_hyp(raw):
+    if '/L2' in raw and raw.endswith('/L2'):
+        return f"L2/{raw[:-3]}.fm"
+    elif '/L2' in raw:
+        return f"L2/{raw}.fm"
+    return f"L3/{raw}.pdf"
+
+
+def build_remark_content(text, hyp_col_f):
+    """Build String/Para lines for the remark cell."""
+    if not text:
+        return ["        <String `'>"]
+
+    has_hyp = '(/' in text
+    has_nl = '\n' in text
+
+    hyp_files = [_resolve_hyp(h.strip()) for h in hyp_col_f.split('\n')
+                 if h.strip()] if hyp_col_f else []
+
+    if not has_hyp and not has_nl:
+        return [f"        <String `{text}'>"]
+
+    out = []
+    remark_lines = text.split('\n') if has_nl else [text]
+    hyp_num = 0
+
+    for li, rline in enumerate(remark_lines):
+        if li > 0:
+            out += [
+                strip_apos("'       > # end of ParaLine"),
+                strip_apos("'      > # end of Para"),
+                strip_apos("'      <Para "),
+                strip_apos("'       <PgfTag `CellBody'>"),
+                strip_apos("'       <ParaLine "),
             ]
 
-    lines += [
-        "     > # end of CellContent",
-        "    > # end of Cell",
-    ]
-    return lines
+        pos = 0
+        while pos <= len(rline):
+            rem = rline[pos:]
+            hp = rem.find('(/')
+            if hp < 0:
+                if rem:
+                    out.append(f"        <String `{rem}'>")
+                break
+            if hp > 0:
+                out.append(f"        <String `{rem[:hp]}'>")
+                out += [strip_apos("'       > # end of ParaLine"),
+                        strip_apos("'       <ParaLine ")]
+                pos += hp
+                rem = rline[pos:]
+            ep = rem.find('/)')
+            if ep < 0:
+                out.append(f"        <String `{rem}'>")
+                break
+            link_text = rem[2:ep]
+            rhyp = hyp_files[hyp_num] if hyp_num < len(hyp_files) else 'L3/unknown.pdf'
+            hyp_num += 1
+            out.extend(_hyp_lines(rhyp))
+            out.append(f"        <String `{link_text}'>")
+            out += [strip_apos("'        <Font "),
+                    strip_apos("'         <FTag `'>"),
+                    strip_apos("'         <FLocked No>"),
+                    strip_apos("'        > # end of Font")]
+            pos += ep + 2
+
+    return out
 
 
-def _cel5_lines(counter: list) -> list:
-    """Cell 5: empty remarks."""
+# ---------------------------------------------------------------------------
+# WI helpers
+# ---------------------------------------------------------------------------
+
+def _wi_basename(path):
+    parts = path.strip('/').split('/')
+    return parts[-1] if parts else path
+
+
+def _wi_extra_paras(wi_extra):
+    """Para+Marker+String lines for additional WI references.
+    Matches VBA CopyOriginLine sequence where <Unique> ends up after > # end of Marker
+    due to VBA inserting at +8 twice (overwriting creates the Unique-after-Marker order).
+    """
     return [
-        "    <Cell",
-        "     <CellContent",
-        "      <Notes",
-        "      > # end of Notes",
-        "      <Para",
-        _u(counter),
-        "       <PgfTag `CellText'>",
-        "       <PgfReferenced Yes>",
-        "       <ParaLine",
-        "        <String `'>",
-        "       > # end of ParaLine",
-        "      > # end of Para",
-        "     > # end of CellContent",
-        "    > # end of Cell",
+        strip_apos("'       <Para "),
+        strip_apos("'       <ParaLine "),
+        strip_apos("'        <Marker "),
+        strip_apos("'         <MType 8>"),
+        strip_apos("'         <MTypeName `Hypertext'>"),
+        f" <MText `openlink ../../{wi_extra}.fm'>",
+        strip_apos("'         <MCurrPage `1'>"),
+        strip_apos("'        > # end of Marker"),
+        strip_apos("'         <Unique 1032877>"),
+        f"<String `{_wi_basename(wi_extra)}'>",
+        strip_apos("'       > # end of ParaLine"),
+        strip_apos("'      > # end of Para"),
     ]
 
 
-def _row_lines(counter: list, description: str, order_code: str, refs: list) -> list:
-    """Full <Row … > # end of Row for one FRU data item."""
-    lines = [
-        "   <Row",
-        "    <RowMaxHeight  35.56001 cm>",
-        "    <RowHeight  1.44639 cm>",
-    ]
-    lines += _cel1_lines(counter)
-    lines += _cel2_lines(counter, description)
-    lines += _cel3_lines(counter, order_code)
-    lines += _cel4_lines(counter, refs)
-    lines += _cel5_lines(counter)
-    lines.append("   > # end of Row")
-    return lines
+# ---------------------------------------------------------------------------
+# Header substitutions
+# ---------------------------------------------------------------------------
+
+def apply_header_subs(doc, doc_number, doc_type, chapter_name,
+                      consumable=False, overview=False):
+    # doc number
+    idx = doc.find_first('xxxxxx')
+    if idx >= 0:
+        doc.lines[idx] = f" <VariableDef `{doc_number}'>"
+
+    # PDF title
+    title = f"{chapter_name} {doc_type} FRU list" if chapter_name else f"{doc_type} FRU list"
+    idx = doc.find_first("<Value `FRU list'>")
+    if idx >= 0:
+        doc.lines[idx] = f" <Value `{title}'>"
+
+    # String ` FRU list' occurrences (for PDF/book title blocks)
+    if consumable:
+        for _ in range(3):
+            idx = doc.find_first("<String ` FRU list'>")
+            if idx >= 0:
+                doc.lines[idx] = "<String ` List'>"
+    elif overview:
+        idx = doc.find_first("<String ` FRU list'>")
+        if idx >= 0:
+            doc.lines[idx] = "<String ` Overview'>"
+        for _ in range(2):
+            idx = doc.find_first("<String ` FRU list'>")
+            if idx >= 0:
+                doc.lines[idx] = "<String `'>"
+
+    # CrossSection variable
+    cross = f"{chapter_name} {doc_type}" if chapter_name else doc_type
+    idx = doc.find_first("<FRU cross section\\>")
+    if idx >= 0:
+        doc.lines[idx] = f" <VariableDef `{cross}'>"
+
+    # L2_Checked=True: delete revision strings (2 each)
+    for _ in range(2):
+        idx = doc.find_first("<String `Revision '>")
+        if idx >= 0:
+            doc.lines[idx] = None
+    for _ in range(2):
+        idx = doc.find_first("<String `A'>")
+        if idx >= 0:
+            doc.lines[idx] = None
+
+    # System applicability: clear 9 cells (L2_Checked=True path)
+    idx = doc.find_first("[System A], [System B]")
+    if idx >= 0:
+        for off in (-6, -5, -4, -3, -2, -1, 0, 1, 2):
+            t = idx + off
+            if 0 <= t < len(doc.lines):
+                doc.lines[t] = None
+
+    # Book filenames
+    for suf in ('APL', 'LOP', 'LOT', 'LOF', 'TOC'):
+        idx = doc.find_first(f'Level 2 - FRU Master List{suf}')
+        if idx >= 0:
+            doc.lines[idx] = f" <FileName `<c\\>{doc_number}{suf}.fm'>"
 
 
-def _fru_table_lines(counter: list, data_rows: list) -> list:
-    """Generate the complete <Tbl … > # end of Tbl block for FRU data."""
-    lines = []
+# ---------------------------------------------------------------------------
+# Row filling (in-document, using find_last to target the newest row)
+# ---------------------------------------------------------------------------
 
-    # FRU table header (TblFormat + TblH), with __UNIQUE__ substituted
-    for tmpl_line in FRU_HEADER_LINES:
-        if tmpl_line == "__UNIQUE__":
-            lines.append(_u(counter))
+def fill_last_row(doc, item_num, description, order_code, wi_raw,
+                  remark_text, hyp_col_f, consumable, overview, cons_info):
+    """Fill placeholder tokens in the most-recently-inserted row template."""
+
+    # Item number
+    idx = doc.find_last("<String `SP_'>")
+    if idx >= 0:
+        doc.lines[idx] = f"<String ` {item_num}'>"
+
+    # Description
+    idx = doc.find_last('SP_001_Description')
+    if idx >= 0:
+        doc.lines[idx] = f"<String ` {description}'>"
+
+    # --- Order code cell ---
+    ohyp = doc.find_last('SP_001_OrderHyp')
+    ostr = doc.find_last('SP_001_Order')
+
+    if consumable:
+        if ostr >= 0:
+            doc.lines[ostr] = f"<String `{order_code}'>" if order_code else ''
+    elif overview:
+        # OverView: col D = order_code in the WI column; col C goes to remark col
+        if ohyp >= 0 and order_code:
+            doc.lines[ohyp] = f" <MText `openlink ../../Database/L3/{order_code}_FRU.fm'>"
+        if ostr >= 0 and order_code:
+            doc.lines[ostr] = f"<String `{order_code}'>"
+        # Remark col = col_c (passed as order_code here in overview mode, see main)
+    else:
+        if order_code and ohyp >= 0:
+            doc.lines[ohyp] = f" <MText `openlink ../../Database/L3/{order_code}_FRU.fm'>"
+            if ostr >= 0:
+                doc.lines[ostr] = f"<String `{order_code}'>"
+        elif ohyp >= 0:
+            for off in (-6, -3, -2, -1, 0, 1, 2, 3):
+                t = ohyp + off
+                if 0 <= t < len(doc.lines):
+                    doc.lines[t] = None
+            if ostr >= 0:
+                doc.lines[ostr] = ''
+
+    # --- Consumable info cell ---
+    if consumable:
+        idx = doc.find_last('Cons_011_Info')
+        if idx >= 0:
+            doc.lines[idx] = f"<String ` {cons_info}'>"
+
+    # --- WI / Replace Instr cell ---
+    rhyp = doc.find_last('SP_001_ReplaceHyp')
+    rstr = doc.find_last('SP_001_Replac')
+
+    if wi_raw and not consumable and not overview:
+        if wi_raw.startswith('/'):
+            all_wi = [w.strip() for w in wi_raw[1:].split('\n')]
         else:
-            lines.append(tmpl_line)
+            all_wi = [w.strip() for w in wi_raw.split('\n')]
+        all_wi = [w for w in all_wi if w]
 
-    # TblBody is already opened by the last line of FRU_HEADER_LINES ("  <TblBody ")
-    for description, order_code, refs in data_rows:
-        lines += _row_lines(counter, description, order_code, refs)
+        wi_first = all_wi[0]
+        wi_rest = all_wi[1:]
 
-    lines.append("  > # end of TblBody")
-    lines.append(" > # end of Tbl")
-    return lines
+        if 'http' in wi_first:
+            us = wi_first.find('(/')
+            ue = wi_first.find('/)')
+            url = wi_first[us+2:ue] if us >= 0 and ue > us else wi_first
+            if rhyp >= 0:
+                doc.lines[rhyp] = f" <MText `message URL {url}'>"
+            wi_display = wi_first[:us].strip() if us > 0 else url
+        else:
+            if rhyp >= 0:
+                doc.lines[rhyp] = f" <MText `openlink ../../{wi_first}.fm'>"
+            # VBA: display = Right(D, Len(D) - pos_of_2nd_slash)
+            # This preserves newlines and all subsequent paths
+            d = wi_raw
+            s1 = d.find('/')
+            s2 = d.find('/', s1 + 1) if s1 >= 0 else -1
+            wi_display = d[s2 + 1:] if s2 >= 0 else _wi_basename(wi_first)
+
+        if rstr >= 0:
+            doc.lines[rstr] = f"<String `{wi_display}'>"
+            # Insert extra WI Para blocks after '> # end of Para' of the first Para
+            # VBA: innerCounter = row(SP_001_Replac) + 2, inserts at innerCounter + 1
+            # i.e., after > # end of ParaLine (rstr+1) and > # end of Para (rstr+2)
+            if wi_rest:
+                insert_pos = rstr + 3
+                for we in wi_rest:
+                    extra = _wi_extra_paras(we)
+                    for j, line in enumerate(extra):
+                        doc.lines.insert(insert_pos + j, line)
+                    insert_pos += len(extra)
+    elif not consumable:
+        if rhyp >= 0:
+            for off in (-3, -2, -1, 0, 1, 2, 3):
+                t = rhyp + off
+                if 0 <= t < len(doc.lines):
+                    doc.lines[t] = None
+        if rstr >= 0:
+            doc.lines[rstr] = ''
+
+    # --- Remark cell ---
+    if not overview:
+        ridx = doc.find_last('SP_001_Remark')
+        if ridx >= 0:
+            rlines = build_remark_content(remark_text or '', hyp_col_f or '')
+            if len(rlines) == 1:
+                doc.lines[ridx] = rlines[0]
+            else:
+                doc.lines[ridx:ridx+1] = rlines
+    else:
+        # OverView: remark column = order code (col C passed via order_code)
+        ridx = doc.find_last('SP_001_Remark')
+        if ridx >= 0:
+            doc.lines[ridx] = f"<String `{order_code}'>" if order_code else ''
 
 
 # ---------------------------------------------------------------------------
-# Template processing
+# GenCh3 loader
 # ---------------------------------------------------------------------------
 
-# Patterns for simple one-liner substitutions in the template
-_RE_CROSS_SECTION = re.compile(r"<VariableDef `<FRU cross section\\>`'>")
-_RE_DOCNR         = re.compile(r"<VariableDef `xxxxxx`'>")
-_RE_PDF_TITLE     = re.compile(r"<Value `FRU list`'>")
-_RE_FILENAME      = re.compile(r"Level 2 - FRU Master List")
-_RE_UNIQUE        = re.compile(r"^\s*<Unique \d+>$")
+def load_gench3(excel_path):
+    wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
+    ws = wb[GENCH3_SHEET]
+
+    def cell(row, col):
+        v = ws.cell(row=row, column=col).value
+        if v is None:
+            return ''
+        return str(v).strip()
+
+    meta = {
+        'A': cell(1, 1),  # doc_number
+        'B': cell(1, 2),  # doc_type
+        'C': cell(1, 3),  # chapter_name
+    }
+
+    last = 1
+    for row in range(2, ws.max_row + 1):
+        if ws.cell(row=row, column=1).value is not None:
+            last = row
+
+    rows = []
+    for row in range(2, last + 1):
+        rows.append({
+            'A': cell(row, 1),
+            'B': cell(row, 2),
+            'C': cell(row, 3),
+            'D': cell(row, 4),
+            'E': cell(row, 5),
+            'F': cell(row, 6),
+            'G': cell(row, 7),
+            'L': cell(row, 12),
+            'M': cell(row, 13),
+            'N': cell(row, 14),
+        })
+
+    wb.close()
+    return meta, rows
 
 
-def process_template(tmpl_path: str, doc_number: str, cross_section: str,
-                     data_rows: list, out_path: str) -> None:
-    """Read template, apply all substitutions, write output MIF."""
+# ---------------------------------------------------------------------------
+# K3List / K3DataNew loaders  (batch mode)
+# ---------------------------------------------------------------------------
 
-    counter  = [1030000]          # mutable unique-ID counter
-    out_lines: list[str] = []
+def _cell_str(v):
+    """Normalise an openpyxl cell value to a plain string."""
+    if v is None:
+        return ''
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
 
-    with open(tmpl_path, encoding="latin-1") as f:
-        tmpl_lines = f.readlines()
+
+def load_k3list(xlsm_path):
+    """Read K3List sheet and return pending 'new templ' items.
+
+    An item is pending when col D = 'Ok' and col E = '' (not 'Done').
+    Returns list of dicts: {doc_number, data_sheet}.
+    Uses iter_rows for fast sequential reading of the xlsm.
+    """
+    wb = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
+    ws = wb['K3List']
+    items = []
+    for rv in ws.iter_rows(min_row=2, values_only=True):
+        if not rv or not rv[0]:
+            break
+        d_col    = _cell_str(rv[3] if len(rv) > 3 else None)   # col D
+        done_col = _cell_str(rv[4] if len(rv) > 4 else None)   # col E
+        template = _cell_str(rv[5] if len(rv) > 5 else None)   # col F
+        ds_ovr   = _cell_str(rv[6] if len(rv) > 6 else None)   # col G
+        if d_col == 'Ok' and done_col == '' and template == 'new templ':
+            ds = ds_ovr if ds_ovr in ('K3DataNew XPS', 'K3DataNew DTS') else 'K3DataNew'
+            items.append({'doc_number': _cell_str(rv[0]), 'data_sheet': ds})
+    wb.close()
+    return items
+
+
+def load_from_k3data(xlsm_path, data_sheet, doc_number):
+    """Load FRU data for doc_number from a K3DataNew-family sheet.
+
+    Replicates the copy-to-GenCh3 logic of ButtonGenerateK3_All_Klepnut:
+      - copies A:H (header + data rows) as main section
+      - if col L of first data row == 'Bullet', appends the AI section:
+          service-row, A:M data copy, service-row, MarkDown row, A:I data copy (N='AI')
+
+    Returns (meta, rows) identical in structure to load_gench3().
+    Uses iter_rows for fast sequential reading.
+    """
+    wb = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
+    ws = wb[data_sheet]
+    # Load sheet into memory once — avoids repeated XML seeks in read_only mode
+    sheet_rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    doc_str = _cell_str(doc_number)
+
+    def gcol(row_tuple, idx, default=''):
+        if row_tuple and len(row_tuple) > idx:
+            return _cell_str(row_tuple[idx])
+        return default
+
+    def make_row(row_tuple, include_lm=False, force_n=''):
+        return {
+            'A': gcol(row_tuple, 0),  'B': gcol(row_tuple, 1),
+            'C': gcol(row_tuple, 2),  'D': gcol(row_tuple, 3),
+            'E': gcol(row_tuple, 4),  'F': gcol(row_tuple, 5),
+            'G': gcol(row_tuple, 6),
+            'L': gcol(row_tuple, 11) if include_lm else '',
+            'M': gcol(row_tuple, 12) if include_lm else '',
+            'N': force_n,
+        }
+
+    # --- Find header row (VBA: Cells.Find(What:=doc_number)) ---
+    header_idx = None
+    for i, rv in enumerate(sheet_rows):
+        if gcol(rv, 0) == doc_str:
+            header_idx = i
+            break
+    if header_idx is None:
+        # Fallback: search all columns
+        for i, rv in enumerate(sheet_rows):
+            if rv and any(_cell_str(v) == doc_str for v in rv):
+                header_idx = i
+                break
+    if header_idx is None:
+        raise ValueError(f"{doc_number!r} not found in sheet '{data_sheet}'")
+
+    # --- Find last data row (VBA: innerCounter_end loop) ---
+    end_idx = header_idx + 1
+    while end_idx < len(sheet_rows):
+        v = gcol(sheet_rows[end_idx], 0)
+        if v in ('', 'Not Used'):
+            break
+        end_idx += 1
+    # data rows are sheet_rows[header_idx+1 : end_idx]
+    data = sheet_rows[header_idx + 1: end_idx]
+
+    # --- Meta from header row ---
+    hdr = sheet_rows[header_idx]
+    meta = {'A': gcol(hdr, 0), 'B': gcol(hdr, 1), 'C': gcol(hdr, 2)}
+
+    # --- Main data rows (VBA copies A:H → L/M/N stay empty) ---
+    rows = [make_row(r) for r in data]
+
+    # --- AI section (if col L of first data row == 'Bullet') ---
+    if data and gcol(data[0], 11) == 'Bullet':
+        svc = {'A': 'Service Virtual Assistant Content', 'B': 'Text',
+               'C': '', 'D': '',
+               'E': 'The following text is used by AI to answer FRU list related questions more accurately.',
+               'F': '', 'G': '', 'L': '', 'M': '', 'N': ''}
+        # Service row 1
+        rows.append(dict(svc))
+        # AI first copy: cols A-M (N stays empty)
+        for r in data:
+            rows.append(make_row(r, include_lm=True, force_n=''))
+        # Service row 2
+        rows.append(dict(svc))
+        # MarkDown row
+        rows.append({'A': 'MarkDown', 'B': '', 'C': '', 'D': '', 'E': '',
+                     'F': '', 'G': '', 'L': '', 'M': '', 'N': 'AI'})
+        # AI second copy: cols A-I (L/M empty, N='AI')
+        for r in data:
+            rows.append(make_row(r, include_lm=False, force_n='AI'))
+
+    return meta, rows
+
+
+# ---------------------------------------------------------------------------
+# Main conversion
+# ---------------------------------------------------------------------------
+
+def generate_mif(meta, rows, blocks, template_path, output_path):
+    """Core MIF generation from in-memory meta/rows data."""
+    doc_number = meta['A']
+    doc_type   = meta['B']
+    ch_meta    = meta['C']
+
+    consumable = (doc_type == 'Consumable')
+    overview   = (doc_type == 'Overview')
+
+    t_start = time.perf_counter()
+    print("Preparing template...")
+    doc = MifDoc(template_path)
+    apply_header_subs(doc, doc_number, doc_type, ch_meta,
+                      consumable=consumable, overview=overview)
+
+    # --- Main row loop ---
+    tbl_id = 11
+    aframe_id = 1
+    chapter = ''
+    tbl_one = True
+    id_count = 1
+    tbl_id_ai = 1   # VBA: TblIdAI – counter for N='AI' and AIContent chapter headings
+    sys_done = False
+    ai_content = False
 
     i = 0
-    # States for A-TextFlow injection
-    in_a_textflow       = False
-    a_tf_title_done     = False   # True after we emitted the Title Para close in 'A' TF
-    atbl_injected       = False   # True after <ATbl 11> Para is injected
-    skip_systemappl     = False   # True while absorbing the SystemAppl para
+    while i < len(rows):
+        r = rows[i]
+        ca = r['A']   # chapter / tag
+        cb = r['B']   # content type or description
+        cc = r['C']   # order code
+        cd = r['D']   # WI ref
+        ce = r['E']   # remark / note text
+        cf = r['F']   # remark hyp file(s)
+        cg = r['G']   # item number
+        cl = r['L']   # "Bullet" marker
+        cm = r['M']   # bullet text
+        cn = r['N']   # "AI" marker
 
-    while i < len(tmpl_lines):
-        raw   = tmpl_lines[i].rstrip("\n")
-        strip = raw.strip()
+        if ca == '' or ca == 'Not Used':
+            break
 
-        # ── 1. Unique ID replacement ────────────────────────────────────────
-        if _RE_UNIQUE.match(raw):
-            out_lines.append(_u(counter) + "\n")
+        # MarkDown block
+        if ca == 'MarkDown':
+            doc.add_before_eof(blocks.I)
+            doc.add_before_eof(build_text_block(blocks.W,
+                f'# {ch_meta} {doc_type} FRU list'))
+            doc.add_before_eof(blocks.I)
+            chapter = ''
+            ai_content = False
+            tbl_id_ai = 1   # VBA resets TblIdAI = 1 at MarkDown
             i += 1
             continue
 
-        # ── 2. Value substitutions ──────────────────────────────────────────
-        # CrossSection VariableDef
-        if strip.startswith("<VariableDef") and "<FRU cross section" in raw:
-            raw = f" <VariableDef `{cross_section}'>"
+        # New chapter
+        if ca != chapter:
+            chapter = ca
 
-        # docnr VariableDef
-        elif strip.startswith("<VariableDef") and "xxxxxx" in raw:
-            raw = f" <VariableDef `{doc_number}'>"
+            if ca not in ('No Chapter', 'System list'):
+                if ai_content or cn == 'AI':
+                    doc.add_before_eof(blocks.I)  # 2pt white (AI section)
+                else:
+                    doc.add_before_eof([l for l in blocks.I
+                                        if '<FSize' not in l
+                                        and "<FColor `White'" not in l
+                                        and '<PgfLeading' not in l])  # 12pt black
 
-        # PDF Title Value
-        elif strip.startswith("<Value") and "FRU list" in raw and "cross section" not in raw:
-            raw = f"  <Value `{cross_section} FRU list'>"
+                if ai_content:
+                    doc.add_before_eof(build_subchapter_block(blocks.V, ca))
+                    tbl_id_ai += 1
+                elif cn == 'AI':
+                    # VBA: addTextProc("## " & CStr(TblIdAI) & ") " & ChapterName)
+                    doc.add_before_eof(build_text_block(blocks.W,
+                        f'## {tbl_id_ai}) {ca}'))
+                    doc.add_before_eof(blocks.I)
+                    tbl_id_ai += 1
+                    i += 1
+                    continue
+                else:
+                    if ca == 'Service Virtual Assistant Content':
+                        doc.add_before_eof(build_subchapter_block(blocks.H, ca))
+                    else:
+                        doc.add_before_eof(build_chapter_block(blocks.H, ca))
 
-        # BookComponent FileName (multiple occurrences)
-        if "<FileName" in raw and "Level 2 - FRU Master List" in raw:
-            raw = raw.replace("Level 2 - FRU Master List", doc_number)
+                if ca == 'Service Virtual Assistant Content':
+                    ai_content = True
 
-        # ── 3. FRU table injection (before "> # end of Tbls") ──────────────
-        if strip == "> # end of Tbls":
-            # Emit FRU table then the closing tag
-            for tbl_line in _fru_table_lines(counter, data_rows):
-                out_lines.append(tbl_line + "\n")
-            out_lines.append(raw + "\n")
+                # VBA: TblOne=True / IDCount=1 only for non-No Chapter / non-System list
+                tbl_one = True
+                id_count = 1
+
+        # === Special content rows ===
+
+        # Image / Chapter / Note / Text / Bullet / AI
+        if cb in ('Image', 'Chapter', 'Note', 'Text') or cl == 'Bullet' or cn == 'AI':
+            if cl == 'Bullet':
+                if cb not in ('Image', 'Chapter'):
+                    doc.add_before_eof(build_bullet_block(blocks.U, cm))
+                i += 1
+                continue
+
+            if cn == 'AI':
+                if cb not in ('Image', 'Chapter'):
+                    if cb == 'Note':
+                        doc.add_before_eof(build_text_block(blocks.W,
+                            f'**Note**: {ce.replace(chr(10)," ")}'))
+                    elif ca == 'System list':
+                        doc.add_before_eof(build_text_block(blocks.W,
+                            f'**Applicable to**: {cb}'))
+                    elif cb == 'Caution':
+                        doc.add_before_eof(build_text_block(blocks.W,
+                            f'**Caution**: {ce.replace(chr(10)," ")}'))
+                    elif cb == 'Link':
+                        doc.add_before_eof(build_text_block(blocks.W,
+                            f'**Link**: {ce.replace(chr(10)," ")}'))
+                        doc.add_before_eof(build_text_block(blocks.W,
+                            f'**HyperLink**: {cf.replace(chr(10),", ")}'))
+                    else:
+                        doc.add_before_eof(build_text_block(blocks.W,
+                            f'- **Description**: {cb}  '))
+                        doc.add_before_eof(build_text_block(blocks.W,
+                            ' **Order Code**, **FRU Code**, **FRU number**: '
+                            f'{cc.replace(chr(10)," ")}  '))
+                        wi_d = cd.replace('Database/L3/','').replace('Database/L2/','')
+                        doc.add_before_eof(build_text_block(blocks.W,
+                            ' **Replacement WI**, **Replacement Work Instruction**: '
+                            f'{wi_d}  '))
+                        rem_c = ce.replace('(/','').replace('/)',''  )
+                        doc.add_before_eof(build_text_block(blocks.W,
+                            f' **Remarks/Other**: {rem_c}  '))
+                        doc.add_before_eof(blocks.I)
+                i += 1
+                continue
+
+            if cb == 'Text':
+                doc.add_before_eof(build_text_block(blocks.W,
+                    f'Note: {ce.replace(chr(10)," ")}'))
+                i += 1
+                continue
+
+            # Note / Image Description as note
+            doc.add_before_eof(build_note_block(blocks.J, ce))
             i += 1
             continue
 
-        # ── 4. A TextFlow handling ──────────────────────────────────────────
-        if strip == "<TextFlow":
-            # Peek at next line for TFTag
-            peek = tmpl_lines[i + 1].strip() if i + 1 < len(tmpl_lines) else ""
-            if "`A'" in peek:
-                in_a_textflow = True
-                a_tf_title_done = False
-                atbl_injected   = False
-                skip_systemappl = False
+        # Caution
+        if cb == 'Caution' and ca == chapter:
+            doc.add_before_eof(build_caution_block(blocks.K, cd))
+            i += 1
+            continue
 
-        if in_a_textflow:
-            # After the CrossSection/Title Para closes, inject <ATbl 11>
-            if a_tf_title_done and not atbl_injected:
-                if strip == "<Para":
-                    # Check if next meaningful line is SystemAppl
-                    j = i + 1
-                    while j < len(tmpl_lines) and not tmpl_lines[j].strip():
-                        j += 1
-                    next_str = ""
-                    for k in range(j, min(j + 5, len(tmpl_lines))):
-                        if "<PgfTag" in tmpl_lines[k]:
-                            next_str = tmpl_lines[k].strip()
-                            break
-                    if "SystemAppl" in next_str:
-                        # Inject the ATbl 11 Para before absorbing SystemAppl
-                        uid = _u(counter)
-                        for atbl_line in [
-                            "<Para",
-                            uid,
-                            "<PgfTag `Text(0)'>",
-                            "<ParaLine",
-                            "<ATbl 11>",
-                            "> # end of ParaLine",
-                            "> # end of Para",
-                        ]:
-                            out_lines.append(atbl_line + "\n")
-                        atbl_injected   = True
-                        skip_systemappl = True
-                        # Don't emit the <Para start; skip to after this para
-                        # Find the > # end of Para matching this <Para
-                        depth = 1
-                        i += 1
-                        while i < len(tmpl_lines) and depth > 0:
-                            s = tmpl_lines[i].strip()
-                            if s == "<Para":
-                                depth += 1
-                            elif s == "> # end of Para":
-                                depth -= 1
-                            i += 1
-                        continue
+        # Link / LinkFree
+        if cb in ('Link', 'LinkFree') and ca == chapter:
+            doc.add_before_eof(build_link_block(blocks.G, ce, cf,
+                                                 link_free=(cb == 'LinkFree')))
+            i += 1
+            continue
 
-            # Detect end of the Title Para (CrossSection para close)
-            if not a_tf_title_done and strip == "> # end of Para":
-                # Check if we've seen CrossSection variable in preceding lines
-                # Simple heuristic: check if a_tf_title_done state should flip
-                # We look back in out_lines for CrossSection marker
-                recent = "".join(out_lines[-30:]) if len(out_lines) >= 30 else "".join(out_lines)
-                if "CrossSection" in recent and "`Title'" in recent:
-                    a_tf_title_done = True
+        # System list
+        if ca == 'System list':
+            if not sys_done:
+                doc.add_before_eof(blocks.T)
+                doc.add_before_end_tbls(blocks.R)
+                doc.replace_first('<TblID_001>', f'<TblID {tbl_id}>')
+                doc.replace_first('<Atbl_001>', f'<ATbl {tbl_id}>')
+                tbl_id += 1
+                sys_done = True
+            sys_row = list(blocks.S)
+            for j, l in enumerate(sys_row):
+                if l and 'System_List' in l:
+                    sys_row[j] = f"<String `{cb}'>"
+                    break
+            doc.add_row_system([l for l in sys_row if l is not None])
+            i += 1
+            continue
 
-        # ── 5. Emit the (possibly modified) line ────────────────────────────
-        out_lines.append(raw + "\n")
+        # Image Description (AFrame) — simplified
+        if cb == 'Image Description' and ca == chapter:
+            doc.add_before_eof(build_note_block(blocks.J, f'Image: {cd}'))
+            aframe_id += 1
+            i += 1
+            continue
+
+        # === Table rows ===
+        if ca == chapter:
+            if cb == '' and not consumable:
+                i += 1
+                continue
+
+            if tbl_one:
+                # First row: insert table definition
+                doc.add_before_eof(blocks.D)           # ATbl Para before EOF
+                if consumable:
+                    doc.add_before_end_tbls(blocks.L_full)
+                elif overview:
+                    doc.add_before_end_tbls(blocks.N_full)
+                    # Rename column headers for OverView
+                    doc.replace_first("<String `Order Code'>", "<String `Item ID'>")
+                    doc.replace_first("<String `Replace Instr.'>", "<String `Order Code '>")
+                    doc.replace_first("<String `Retrofit / Remarks / Other'>",
+                                      "<String  `Replace Instr.'>")
+                else:
+                    doc.add_before_end_tbls(blocks.C_full)
+                    # Rename remarks column for L2_Checked standard table
+                    doc.replace_first("<String `Retrofit / Remarks / Other'>",
+                                      "<String `Remarks / Other'>")
+
+                doc.replace_first('<TblID_001>', f'<TblID {tbl_id}>')
+                doc.replace_first('<Atbl_001>', f'<ATbl {tbl_id}>')
+                tbl_id += 1
+                tbl_one = False
+            else:
+                if consumable:
+                    doc.add_row_before_end_tbls(list(blocks.L_row))
+                elif overview:
+                    doc.add_row_before_end_tbls(list(blocks.N_row))
+                else:
+                    doc.add_row_before_end_tbls(list(blocks.C_row))
+
+            # For OverView, the WI column (col D) holds the order code for the link
+            ov_order = cd if overview else cc
+            fill_last_row(
+                doc,
+                item_num=cg,
+                description=cb,
+                order_code=ov_order,
+                wi_raw=cd if not overview else '',
+                remark_text=ce,
+                hyp_col_f=cf,
+                consumable=consumable,
+                overview=overview,
+                cons_info=cd,
+            )
+
+        # Revision check
+        if i + 1 < len(rows) and rows[i+1]['A'] == 'Revision':
+            break
+
         i += 1
 
-    with open(out_path, "w", encoding="latin-1", newline="\n") as f:
-        f.writelines(out_lines)
+    t_rows = time.perf_counter()
+    print(f"Applying Unique IDs...  (rows: {t_rows - t_start:.1f}s)")
+    doc.change_unique()
 
-    print(f"Written: {out_path}")
-    print(f"  Lines: {len(out_lines)}")
-    print(f"  Unique IDs assigned: {counter[0] - 1030000}")
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    output_lines = doc.get_output()
+    print(f"Writing {output_path}  ({len(output_lines)} lines)...")
+    with open(output_path, 'w', encoding='latin-1', newline='\n') as f:
+        for line in output_lines:
+            try:
+                f.write(line + '\n')
+            except UnicodeEncodeError:
+                f.write(line.encode('latin-1', errors='replace').decode('latin-1') + '\n')
+
+    t_done = time.perf_counter()
+    print(f"Done.  ({t_done - t_start:.1f}s total)")
+    return output_path
+
+
+def convert(excel_path, template_path=None, output_path=None):
+    """Single-file mode: read GenCh3 sheet from xlsx and generate MIF."""
+    if template_path is None:
+        template_path = TEMPLATE_MIF
+    for p, name in [(template_path, 'Template MIF'), (XLSM_FILE, 'Ch3 Generator.xlsm')]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"{name} not found: {p}")
+
+    t0 = time.perf_counter()
+    print("Loading template blocks...")
+    blocks = Blocks(XLSM_FILE)
+    print(f"Template blocks loaded.  ({time.perf_counter() - t0:.1f}s)")
+
+    print(f"Loading {os.path.basename(excel_path)}...")
+    meta, rows = load_gench3(excel_path)
+    print(f"Data loaded.  ({time.perf_counter() - t0:.1f}s)")
+
+    if output_path is None:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        output_path = os.path.join(OUTPUT_DIR, f"{meta['A']}_d1.mif")
+
+    return generate_mif(meta, rows, blocks, template_path, output_path)
+
+
+def convert_all(xlsm_path=None, template_path=None, output_dir=None):
+    """Batch mode: process all pending K3List items from Ch3 Generator.xlsm.
+
+    Replicates ButtonGenerateK3_All_Klepnut: iterates K3List rows where
+    col D='Ok', col E='' (not done), col F='new templ', and generates a
+    MIF file for each item using data from the appropriate K3DataNew sheet.
+    """
+    if xlsm_path is None:
+        xlsm_path = XLSM_FILE
+    if template_path is None:
+        template_path = TEMPLATE_MIF
+    if output_dir is None:
+        output_dir = OUTPUT_DIR
+
+    for p, name in [(xlsm_path, 'Ch3 Generator.xlsm'), (template_path, 'Template MIF')]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"{name} not found: {p}")
+
+    t_batch = time.perf_counter()
+    print("Loading template blocks...")
+    blocks = Blocks(xlsm_path)
+    t_blocks = time.perf_counter()
+    print(f"Template blocks loaded.  ({t_blocks - t_batch:.1f}s)")
+
+    items = load_k3list(xlsm_path)
+    if not items:
+        print("No pending items in K3List (col D='Ok', col E='', col F='new templ').")
+        return []
+
+    print(f"Found {len(items)} item(s) to process: "
+          f"{', '.join(it['doc_number'] for it in items)}")
+
+    generated = []
+    for idx, item in enumerate(items, 1):
+        doc_number = item['doc_number']
+        data_sheet = item['data_sheet']
+        t_item = time.perf_counter()
+        print(f"\n[{idx}/{len(items)}] {doc_number}  (sheet: {data_sheet})")
+        try:
+            meta, rows = load_from_k3data(xlsm_path, data_sheet, doc_number)
+            t_load = time.perf_counter()
+            print(f"Data loaded.  ({t_load - t_item:.1f}s)")
+            os.makedirs(output_dir, exist_ok=True)
+            out = os.path.join(output_dir, f"{doc_number}_d1.mif")
+            generate_mif(meta, rows, blocks, template_path, out)
+            generated.append(out)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    t_end = time.perf_counter()
+    print(f"\nBatch complete. Generated {len(generated)}/{len(items)} file(s).  "
+          f"Total: {t_end - t_batch:.1f}s")
+    return generated
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
+    args = sys.argv[1:]
+
+    if not args or args[0] == '--all':
+        # Batch mode: process all pending K3List items
+        try:
+            convert_all()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        return
+
+    excel_path    = args[0]
+    template_path = args[1] if len(args) > 1 else None
+    output_path   = args[2] if len(args) > 2 else None
+
+    if not os.path.exists(excel_path):
+        alt = os.path.join(PROJECT_DIR, excel_path)
+        if os.path.exists(alt):
+            excel_path = alt
+        else:
+            print(f"File not found: {excel_path}")
+            sys.exit(1)
+
+    try:
+        convert(excel_path, template_path, output_path)
+    except Exception:
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
-    xlsx_path = sys.argv[1]
-    tmpl_path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_TMPL
-    out_path  = sys.argv[3] if len(sys.argv) > 3 else None
 
-    if out_path is None:
-        base     = os.path.splitext(xlsx_path)[0]
-        out_path = base + "_d1.mif"
-
-    print(f"Excel   : {xlsx_path}")
-    print(f"Template: {tmpl_path}")
-    print(f"Output  : {out_path}")
-
-    doc_number, cross_section, data_rows = read_excel(xlsx_path)
-    print(f"  doc_number    = {doc_number}")
-    print(f"  cross_section = {cross_section}")
-    print(f"  data rows     = {len(data_rows)}")
-
-    process_template(tmpl_path, doc_number, cross_section, data_rows, out_path)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
