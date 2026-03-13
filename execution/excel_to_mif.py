@@ -79,26 +79,57 @@ class Blocks:
     """MIF template blocks from TblInsertNewTempl sheet."""
 
     def __init__(self, xlsm_path):
-        wb = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
-        ws = wb[TBL_SHEET]
+        wb     = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
+        wb_raw = openpyxl.load_workbook(xlsm_path, read_only=True)
+        ws     = wb[TBL_SHEET]
+        ws_raw = wb_raw[TBL_SHEET]
 
-        def gc(letter, start=2):
-            return get_contiguous(ws, col_num(letter), start)
+        def get_val(row, col, ai_mode=False):
+            """Return cell value; formula cells returning None are resolved via raw workbook."""
+            v = ws.cell(row=row, column=col).value
+            if v is None:
+                fv = ws_raw.cell(row=row, column=col).value
+                if isinstance(fv, str) and fv.startswith('=IF($B$1="AI",'):
+                    if ai_mode:
+                        m = re.match(r'^=IF\(\$B\$1="AI","(.*)",".*"\)$', fv)
+                        return m.group(1) if m else ''
+                    return ''   # formula evaluates to "" when B1 != "AI"
+                return None     # truly empty cell
+            return str(v)
+
+        def gc(letter, start=2, ai_mode=False):
+            col = col_num(letter)
+            result = []
+            for row in range(start, ws.max_row + 1):
+                v = get_val(row, col, ai_mode=ai_mode)
+                if v is None:
+                    break
+                result.append(v)
+            return result
 
         def gr(letter, r1, r2):
-            return get_rows(ws, col_num(letter), r1, r2)
+            col = col_num(letter)
+            result = []
+            for row in range(r1, r2 + 1):
+                v = get_val(row, col)
+                if v is not None:
+                    result.append(v)
+            return result
 
         # Before-EOF blocks
-        self.I = gc('I')        # empty line (2pt white in template)
-        self.H = gc('H')        # new chapter (Title 1)
-        self.V = gc('V')        # sub-chapter (AI)
-        self.G = gc('G')        # link
-        self.J = gc('J')        # note
-        self.K = gc('K')        # caution
-        self.U = gc('U')        # bullet (AI)
-        self.W = gc('W')        # text (AI)
-        self.D = gc('D')        # ATbl para (standard/consumable/overview)
-        self.T = gc('T')        # ATbl para (system table)
+        self.I     = gc('I')                 # empty line — non-AI (no font overrides)
+        self.I_ai  = gc('I', ai_mode=True)   # empty line — AI section (2pt white)
+        self.H     = gc('H', ai_mode=True)   # chapter; build_chapter_block strips FSize/FColor
+        self.V     = gc('V', ai_mode=True)   # sub-chapter — always invisible (2pt white)
+        self.G     = gc('G')                 # link
+        self.J     = gc('J')                 # note
+        self.K     = gc('K')                 # caution
+        self.U     = gc('U')                 # bullet — non-AI
+        self.U_ai  = gc('U', ai_mode=True)   # bullet — AI section (2pt white)
+        self.W     = gc('W')                 # text — non-AI
+        self.W_ai  = gc('W', ai_mode=True)   # text — AI section (2pt white)
+        self.D     = gc('D')                 # ATbl para (standard/consumable/overview)
+        self.T     = gc('T')                 # ATbl para (system table)
 
         # Standard FRU table (col C inserted before > # end of Tbls)
         self.C_full = gc('C')               # full table (header+row+footer)
@@ -117,6 +148,7 @@ class Blocks:
         self.S = gc('S')
 
         wb.close()
+        wb_raw.close()
 
 
 # ---------------------------------------------------------------------------
@@ -668,17 +700,14 @@ def load_k3list(xlsm_path):
 def load_from_k3data(xlsm_path, data_sheet, doc_number):
     """Load FRU data for doc_number from a K3DataNew-family sheet.
 
-    Replicates the copy-to-GenCh3 logic of ButtonGenerateK3_All_Klepnut:
-      - copies A:H (header + data rows) as main section
-      - if col L of first data row == 'Bullet', appends the AI section:
-          service-row, A:M data copy, service-row, MarkDown row, A:I data copy (N='AI')
+    Builds an in-memory GenCh3-equivalent array from K3DataNew, assuming
+    columns I-M have been deleted from the source sheet.  I-M values are
+    synthesised: I = doc_number (header col A); L/M/N computed per section.
 
     Returns (meta, rows) identical in structure to load_gench3().
-    Uses iter_rows for fast sequential reading.
     """
     wb = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
     ws = wb[data_sheet]
-    # Load sheet into memory once — avoids repeated XML seeks in read_only mode
     sheet_rows = list(ws.iter_rows(values_only=True))
     wb.close()
 
@@ -689,15 +718,34 @@ def load_from_k3data(xlsm_path, data_sheet, doc_number):
             return _cell_str(row_tuple[idx])
         return default
 
-    def make_row(row_tuple, include_lm=False, force_n=''):
+    def _compute_m(b, c, d, e, f):
+        """Python equivalent of the column-M Excel formula in K3DataNew sheets."""
+        if b == c:                          # System-list "Applicable to" rows
+            return f'Applicable to: [{b}];'
+        if b == 'Note':
+            return f'Note: [{e.replace(chr(10), " ")}];'
+        if b == 'Caution':
+            return f'Caution: [{d.replace(chr(10), " ")}];'
+        if b == 'Link':
+            e2 = e.replace('(/', '').replace('/)', '').replace(chr(10), ' ')
+            f2 = f.replace(chr(10), ', ')
+            return f'Link: [{e2}], Hyperlink: [{f2}];'
+        c2 = c.replace(chr(10), ' ')
+        d2 = (d.replace('Database/L2/', '').replace('Database/L3/', '')
+                .replace(chr(10), ', '))
+        e2 = e.replace('(/', '').replace('/)', '').replace(chr(10), ' ')
+        return (f'Description: [{b}], FRU Code, FRU number, Order Code: [{c2}], '
+                f'Replacement Work Instruction: [{d2}], Remarks/Other: [{e2}];')
+
+    def data_row(r, col_l='', col_m='', col_n=''):
+        """Build a GenCh3-equivalent row dict from a raw K3DataNew data row."""
         return {
-            'A': gcol(row_tuple, 0),  'B': gcol(row_tuple, 1),
-            'C': gcol(row_tuple, 2),  'D': gcol(row_tuple, 3),
-            'E': gcol(row_tuple, 4),  'F': gcol(row_tuple, 5),
-            'G': gcol(row_tuple, 6),
-            'L': gcol(row_tuple, 11) if include_lm else '',
-            'M': gcol(row_tuple, 12) if include_lm else '',
-            'N': force_n,
+            'A': gcol(r, 0), 'B': gcol(r, 1),
+            'C': gcol(r, 2), 'D': gcol(r, 3),
+            'E': gcol(r, 4), 'F': gcol(r, 5),
+            'G': gcol(r, 6),
+            'I': ri,         'J': '',          'K': '',
+            'L': col_l,      'M': col_m,       'N': col_n,
         }
 
     # --- Find header row (VBA: Cells.Find(What:=doc_number)) ---
@@ -715,42 +763,48 @@ def load_from_k3data(xlsm_path, data_sheet, doc_number):
     if header_idx is None:
         raise ValueError(f"{doc_number!r} not found in sheet '{data_sheet}'")
 
-    # --- Find last data row (VBA: innerCounter_end loop) ---
+    # --- Find last data row (VBA: innerCounter_end loop, col A) ---
     end_idx = header_idx + 1
     while end_idx < len(sheet_rows):
         v = gcol(sheet_rows[end_idx], 0)
         if v in ('', 'Not Used'):
             break
         end_idx += 1
-    # data rows are sheet_rows[header_idx+1 : end_idx]
     data = sheet_rows[header_idx + 1: end_idx]
 
-    # --- Meta from header row ---
+    # --- Meta from header row (A=doc_number, B=doc_type, C=ch_meta) ---
     hdr = sheet_rows[header_idx]
     meta = {'A': gcol(hdr, 0), 'B': gcol(hdr, 1), 'C': gcol(hdr, 2)}
 
-    # --- Main data rows (VBA copies A:H → L/M/N stay empty) ---
-    rows = [make_row(r) for r in data]
+    # I = doc_number constant (was K3DataNew col I; now derived from header col A)
+    ri = gcol(hdr, 0)
 
-    # --- AI section (if col L of first data row == 'Bullet') ---
-    if data and gcol(data[0], 11) == 'Bullet':
-        svc = {'A': 'Service Virtual Assistant Content', 'B': 'Text',
-               'C': '', 'D': '',
-               'E': 'The following text is used by AI to answer FRU list related questions more accurately.',
-               'F': '', 'G': '', 'L': '', 'M': '', 'N': ''}
-        # Service row 1
-        rows.append(dict(svc))
-        # AI first copy: cols A-M (N stays empty)
-        for r in data:
-            rows.append(make_row(r, include_lm=True, force_n=''))
-        # Service row 2
-        rows.append(dict(svc))
-        # MarkDown row
-        rows.append({'A': 'MarkDown', 'B': '', 'C': '', 'D': '', 'E': '',
-                     'F': '', 'G': '', 'L': '', 'M': '', 'N': 'AI'})
-        # AI second copy: cols A-I (L/M empty, N='AI')
-        for r in data:
-            rows.append(make_row(r, include_lm=False, force_n='AI'))
+    # --- Main section: VBA copies A:H from K3DataNew; L/M/N empty ---
+    rows = [data_row(r) for r in data]
+
+    # --- AI section: always included for K3DataNew when data exists ---
+    # (col L was 'Bullet' in K3DataNew before I-M columns were deleted)
+    if data:
+        svc = {
+            'A': 'Service Virtual Assistant Content', 'B': 'Text',
+            'C': '', 'D': '',
+            'E': 'The following text is used by AI to answer FRU list related questions more accurately.',
+            'F': '', 'G': '', 'I': '', 'J': '', 'K': '', 'L': '', 'M': '', 'N': '',
+        }
+        rows.append(dict(svc))                       # service row 1
+
+        for r in data:                               # AI first copy: L='Bullet', M=computed
+            m = _compute_m(gcol(r, 1), gcol(r, 2),
+                           gcol(r, 3), gcol(r, 4), gcol(r, 5))
+            rows.append(data_row(r, col_l='Bullet', col_m=m))
+
+        rows.append(dict(svc))                       # service row 2
+        rows.append({                                # MarkDown row
+            'A': 'MarkDown', 'B': '', 'C': '', 'D': '', 'E': '',
+            'F': '', 'G': '', 'I': '', 'J': '', 'K': '', 'L': '', 'M': '', 'N': 'AI',
+        })
+        for r in data:                               # AI second copy: N='AI'
+            rows.append(data_row(r, col_n='AI'))
 
     return meta, rows
 
@@ -803,10 +857,10 @@ def generate_mif(meta, rows, blocks, template_path, output_path):
 
         # MarkDown block
         if ca == 'MarkDown':
-            doc.add_before_eof(blocks.I)
-            doc.add_before_eof(build_text_block(blocks.W,
+            doc.add_before_eof(blocks.I_ai)
+            doc.add_before_eof(build_text_block(blocks.W_ai,
                 f'# {ch_meta} {doc_type} FRU list'))
-            doc.add_before_eof(blocks.I)
+            doc.add_before_eof(blocks.I_ai)
             chapter = ''
             ai_content = False
             tbl_id_ai = 1   # VBA resets TblIdAI = 1 at MarkDown
@@ -819,21 +873,18 @@ def generate_mif(meta, rows, blocks, template_path, output_path):
 
             if ca not in ('No Chapter', 'System list'):
                 if ai_content or cn == 'AI':
-                    doc.add_before_eof(blocks.I)  # 2pt white (AI section)
+                    doc.add_before_eof(blocks.I_ai)  # 2pt white (AI section)
                 else:
-                    doc.add_before_eof([l for l in blocks.I
-                                        if '<FSize' not in l
-                                        and "<FColor `White'" not in l
-                                        and '<PgfLeading' not in l])  # 12pt black
+                    doc.add_before_eof(blocks.I)     # 12pt black (non-AI)
 
                 if ai_content:
                     doc.add_before_eof(build_subchapter_block(blocks.V, ca))
                     tbl_id_ai += 1
                 elif cn == 'AI':
                     # VBA: addTextProc("## " & CStr(TblIdAI) & ") " & ChapterName)
-                    doc.add_before_eof(build_text_block(blocks.W,
+                    doc.add_before_eof(build_text_block(blocks.W_ai,
                         f'## {tbl_id_ai}) {ca}'))
-                    doc.add_before_eof(blocks.I)
+                    doc.add_before_eof(blocks.I_ai)
                     tbl_id_ai += 1
                     i += 1
                     continue
@@ -856,45 +907,47 @@ def generate_mif(meta, rows, blocks, template_path, output_path):
         if cb in ('Image', 'Chapter', 'Note', 'Text') or cl == 'Bullet' or cn == 'AI':
             if cl == 'Bullet':
                 if cb not in ('Image', 'Chapter'):
-                    doc.add_before_eof(build_bullet_block(blocks.U, cm))
+                    doc.add_before_eof(build_bullet_block(
+                        blocks.U_ai if ai_content else blocks.U, cm))
                 i += 1
                 continue
 
             if cn == 'AI':
                 if cb not in ('Image', 'Chapter'):
                     if cb == 'Note':
-                        doc.add_before_eof(build_text_block(blocks.W,
+                        doc.add_before_eof(build_text_block(blocks.W_ai,
                             f'**Note**: {ce.replace(chr(10)," ")}'))
                     elif ca == 'System list':
-                        doc.add_before_eof(build_text_block(blocks.W,
+                        doc.add_before_eof(build_text_block(blocks.W_ai,
                             f'**Applicable to**: {cb}'))
                     elif cb == 'Caution':
-                        doc.add_before_eof(build_text_block(blocks.W,
+                        doc.add_before_eof(build_text_block(blocks.W_ai,
                             f'**Caution**: {ce.replace(chr(10)," ")}'))
                     elif cb == 'Link':
-                        doc.add_before_eof(build_text_block(blocks.W,
+                        doc.add_before_eof(build_text_block(blocks.W_ai,
                             f'**Link**: {ce.replace(chr(10)," ")}'))
-                        doc.add_before_eof(build_text_block(blocks.W,
+                        doc.add_before_eof(build_text_block(blocks.W_ai,
                             f'**HyperLink**: {cf.replace(chr(10),", ")}'))
                     else:
-                        doc.add_before_eof(build_text_block(blocks.W,
+                        doc.add_before_eof(build_text_block(blocks.W_ai,
                             f'- **Description**: {cb}  '))
-                        doc.add_before_eof(build_text_block(blocks.W,
+                        doc.add_before_eof(build_text_block(blocks.W_ai,
                             ' **Order Code**, **FRU Code**, **FRU number**: '
                             f'{cc.replace(chr(10)," ")}  '))
                         wi_d = cd.replace('Database/L3/','').replace('Database/L2/','')
-                        doc.add_before_eof(build_text_block(blocks.W,
+                        doc.add_before_eof(build_text_block(blocks.W_ai,
                             ' **Replacement WI**, **Replacement Work Instruction**: '
                             f'{wi_d}  '))
                         rem_c = ce.replace('(/','').replace('/)',''  )
-                        doc.add_before_eof(build_text_block(blocks.W,
+                        doc.add_before_eof(build_text_block(blocks.W_ai,
                             f' **Remarks/Other**: {rem_c}  '))
-                        doc.add_before_eof(blocks.I)
+                        doc.add_before_eof(blocks.I_ai)
                 i += 1
                 continue
 
             if cb == 'Text':
-                doc.add_before_eof(build_text_block(blocks.W,
+                doc.add_before_eof(build_text_block(
+                    blocks.W_ai if ai_content else blocks.W,
                     f'Note: {ce.replace(chr(10)," ")}'))
                 i += 1
                 continue
