@@ -26,6 +26,7 @@ TEMPLATE_MIF = os.path.join(PROJECT_DIR, "Level 2 - FRU Master List_templ.mif")
 OUTPUT_DIR = os.path.join(PROJECT_DIR, "L2 update")
 TBL_SHEET = "TblInsertNewTempl"
 GENCH3_SHEET = "GenCh3"
+INJECT_DIR = os.path.join(SCRIPT_DIR, 'inject')
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -69,6 +70,70 @@ def split_200(text):
     for i in range(0, max(len(text), 1), 200):
         chunks.append(text[i:i+200])
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Chapter injection helpers
+# ---------------------------------------------------------------------------
+
+def load_inject_mif(path):
+    """Parse a full or stripped injection .mif file.
+    For a full MIF file: extracts all AFrames content + the last TextFlow tagged 'A'.
+    Returns (aframes_lines, content_lines).
+    """
+    with open(path, encoding='latin-1') as f:
+        lines = [l.rstrip('\r\n') for l in f]
+
+    aframes = []
+    tf_blocks = []       # list of lists — one per TextFlow A block found
+    current_tf = None    # lines of the TextFlow block being collected
+    current_is_a = False
+    mode = None
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith('<AFrames'):
+            mode = 'aframes'
+            continue
+        if stripped == '> # end of AFrames':
+            mode = None
+            continue
+        if stripped.startswith('<TextFlow'):
+            mode = 'tf'
+            current_tf = []
+            current_is_a = False
+            continue
+        if stripped == '> # end of TextFlow':
+            if mode == 'tf' and current_is_a:
+                tf_blocks.append(current_tf)
+            mode = None
+            current_tf = None
+            continue
+
+        if mode == 'aframes':
+            aframes.append(line)
+        elif mode == 'tf':
+            if stripped.startswith("<TFTag `A'>"):
+                current_is_a = True
+                continue   # skip TFTag line (header)
+            if stripped in ('<TFAutoConnect Yes>', '<Notes', '> # end of Notes'):
+                continue   # skip TF header lines
+            if stripped.startswith('<TextRectID'):
+                continue   # strip page-specific frame refs
+            current_tf.append(line)
+
+    content = tf_blocks[-1] if tf_blocks else []
+    return aframes, content
+
+
+def _chapter_name_from_mif(content_lines):
+    """Return the first <String `...`> value found in MIF content lines."""
+    for line in content_lines:
+        s = line.strip()
+        if s.startswith("<String `") and s.endswith("'>"):
+            return s[9:-2]
+    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +267,7 @@ class MifDoc:
         self._insert(idx - 5, block)
 
     def add_before_end_aframes(self, block):
-        idx = self.find_last("# end of Aframes")
+        idx = self.find_last("# end of AFrames")
         self._insert(idx, block)
 
     def replace_first(self, what, replacement, start=0):
@@ -837,6 +902,7 @@ def generate_mif(meta, rows, blocks, template_path, output_path):
     tbl_id_ai = 1   # VBA: TblIdAI – counter for N='AI' and AIContent chapter headings
     sys_done = False
     ai_content = False
+    inject_name_cache = {}   # col-C path → resolved chapter name
 
     i = 0
     while i < len(rows):
@@ -867,6 +933,37 @@ def generate_mif(meta, rows, blocks, template_path, output_path):
             i += 1
             continue
 
+        # Data-driven chapter injection
+        if ca == 'Inject Chapter':
+            file_path = cc if os.path.isabs(cc) else os.path.join(INJECT_DIR, cc)
+            if cn != 'AI' and not ai_content:
+                aframes_lines, content_lines = load_inject_mif(file_path)
+                ch_name = (ce if ce and ce != 'Original name'
+                           else _chapter_name_from_mif(content_lines))
+                inject_name_cache[cc] = ch_name
+                if ce and ce != 'Original name':
+                    for _j, _l in enumerate(content_lines):
+                        s = _l.strip()
+                        if s.startswith("<String `") and s.endswith("'>"):
+                            indent = _l[: len(_l) - len(_l.lstrip())]
+                            content_lines[_j] = indent + f"<String `{ce}'>"
+                            break
+                doc.add_before_eof(blocks.I)
+                doc.add_before_end_aframes(aframes_lines)
+                doc.add_before_eof(content_lines)
+            elif cn == 'AI':
+                ch_name = (ce if ce and ce != 'Original name'
+                           else inject_name_cache.get(cc, _chapter_name_from_mif(
+                               load_inject_mif(file_path)[1])))
+                doc.add_before_eof(blocks.I_ai)
+                doc.add_before_eof(build_text_block(blocks.W_ai,
+                    f'## {tbl_id_ai}) {ch_name}'))
+                doc.add_before_eof(blocks.I_ai)
+                tbl_id_ai += 1
+            chapter = ''   # reset so the next "Inject Chapter" row also triggers detection
+            i += 1
+            continue
+
         # New chapter
         if ca != chapter:
             chapter = ca
@@ -882,8 +979,9 @@ def generate_mif(meta, rows, blocks, template_path, output_path):
                     tbl_id_ai += 1
                 elif cn == 'AI':
                     # VBA: addTextProc("## " & CStr(TblIdAI) & ") " & ChapterName)
+                    ai_ch_name = (ce if ce and ce != 'Original name' else ca)
                     doc.add_before_eof(build_text_block(blocks.W_ai,
-                        f'## {tbl_id_ai}) {ca}'))
+                        f'## {tbl_id_ai}) {ai_ch_name}'))
                     doc.add_before_eof(blocks.I_ai)
                     tbl_id_ai += 1
                     i += 1
@@ -892,7 +990,8 @@ def generate_mif(meta, rows, blocks, template_path, output_path):
                     if ca == 'Service Virtual Assistant Content':
                         doc.add_before_eof(build_subchapter_block(blocks.H, ca))
                     else:
-                        doc.add_before_eof(build_chapter_block(blocks.H, ca))
+                        ch_display = (ce if ce and ce != 'Original name' else ca)
+                        doc.add_before_eof(build_chapter_block(blocks.H, ch_display))
 
                 if ca == 'Service Virtual Assistant Content':
                     ai_content = True

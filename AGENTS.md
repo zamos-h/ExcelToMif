@@ -49,7 +49,12 @@ Directives are living documents. When you discover API constraints, better appro
 - **Contribution**: If you perform a "Self-anneal" and significantly improve a script or directive locally, notify the user. Ask: "Should I propagate this improvement back to the Global Library?"
 - **Consistency**: Ensure that local modifications don't break the core logic of the global tool unless specifically required by the project's unique constraints.
 
-**5. Portable Environment Management**
+**5. Filesystem Scope**
+- **Stay in project**: All file operations (read, write, delete, move) are restricted to the project root and its subdirectories, unless explicitly instructed otherwise.
+- **Allowed exceptions**: External venv directory (e.g., `D:\.venvs\project_name\`) and Global Library (`D:\dev\ai-global-library\`) — only when explicitly required by principles 4 and 5.
+- **Never touch**: System directories, user profile outside project, other projects, or any path not listed above. If a task seems to require writing outside the project root, stop and ask the user first.
+
+**6. Portable Environment Management**
 - **External VENV**: Always create and use the Python virtual environment (venv) OUTSIDE the project root (e.g., in `D:\.venvs\project_name\`) to keep the project folder portable and clean.
 - **Dependency Tracking**: Every time you install a new library via `pip`, you MUST immediately update `requirements.txt` in the project root.
 - **Project Initialization**: When starting on a new machine, check for `requirements.txt`. If the external venv does not exist, create it and install all listed dependencies before running any scripts in `execution\`.
@@ -84,6 +89,7 @@ Directives are living documents. When you discover API constraints, better appro
 - Validate and sanitize all user inputs before passing to execution scripts
 - Use environment variables for all sensitive data
 - Add `.env`, `credentials.json`, `token.json` to `.gitignore`
+- **Never read, write, or delete files outside the project root** without explicit user approval (see Operating Principle 5)
 
 **Credential Storage:**
 ```
@@ -275,5 +281,6 @@ You sit between human intent (directives) and deterministic execution (Python sc
 - Self-anneal: Learn from every error
 - Communicate clearly: Tell user what you're doing and why
 - Secure by default: Never expose credentials
+- Stay scoped: Never touch files outside the project root without explicit approval
 
 Be pragmatic. Be reliable. Self-anneal.

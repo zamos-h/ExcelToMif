@@ -94,3 +94,4 @@ python execution\excel_to_mif.py input.xlsx template.mif output.mif
 - WI display string: `Right(D, Len(D) - InStr(2nd slash))` preserves embedded `\n` and subsequent WI paths in a single String spanning multiple output lines
 - WI extra Para (2nd+ WI paths): `<Unique>` appears AFTER `> # end of Marker` (VBA double-insert-at-+8 artifact)
 - Remark hyperlinks use `(/text/)` syntax in col E; col F provides hyperlink file paths (newline-separated)
+- `TblInsertNewTempl` block columns (I, H, V, J, K, U, W) contain `=IF($B$1="AI","x","")` formula cells that return `None` with `data_only=True` (no cached value). Fix: `Blocks.__init__` opens a second workbook without `data_only` to detect these formula cells and returns `""` for them, allowing `get_contiguous` to read past them and capture the full block including closing tags (`> # end of PgfFont`, `> # end of Pgf`, `<ParaLine`, etc.). The `""` strings are filtered by `get_output`.
